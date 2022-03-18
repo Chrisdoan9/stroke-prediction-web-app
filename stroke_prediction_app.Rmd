@@ -1,0 +1,365 @@
+---
+title: "Stroke"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    logo: img_heart/1.jpg
+    theme: united
+    source_code: embed
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+```
+
+
+-----------------------------------------------------------------------
+
+
+```{r global, include = FALSE}
+library(glmnet)
+library(PerformanceAnalytics)
+library(tidymodels)
+library(shiny)
+library(vip)
+library(readr)
+library(skimr)
+library(DT)
+library(wesanderson)
+library(shinyWidgets)
+heart <- read.csv("stroke copy.csv") %>%
+  mutate_if(is.character, as.factor) %>% as.tibble()
+
+# For figure color scheme
+hotel.palette <- wes_palette("GrandBudapest2")
+
+```
+
+Sidebar {.sidebar}
+===========================================================
+`r h3("Objective:")`
+`r h3("Predict who have high risk of a stroke.")`
+<br>
+
+- - -
+<br>
+
+```{r}
+fileInput("file1","Choose a CSV file")
+```
+
+```{r}
+numericRangeInput(inputId = "age",
+                  label = "Age Range Input:",
+                  value = c(min(heart$age), max(heart$age)))
+```
+
+```{r}
+sliderInput(
+  inputId = "training_slider",
+  label   = h4("Training Data Proportion"),
+  min     = 0.10,
+  max     = 0.90,
+  value   = 0.75,
+  step    = 0.05,
+  ticks   = FALSE
+)
+```
+
+```{r data.filtered}
+heart_filtered <- reactive({
+  heart %>%
+    filter(age %>% between(left  = input$age[1],
+                           right = input$age[2]))
+})
+```
+### Predictors:
+1. Gender
+2. Age
+3. Hypertention
+4. Heart disease
+5. Ever married
+6. Work type
+7. Residence type
+8. Glucose level
+9. BMI
+10. Smoking status  
+
+### Outcome:
+Stroke(Yes/No)
+
+```{r data.splitting}
+# Data splitting and resampling
+set.seed(123)
+
+splits <- reactive({
+  initial_split(heart_filtered(),
+                strata = stroke,
+                prop   = input$training_slider)
+})
+
+
+heart_other <- reactive({
+  training(splits())
+})
+
+heart_test  <- reactive({
+  testing(splits())
+})
+
+
+# Create a validation set
+set.seed(234)
+prop.validation <- .20
+
+val_set <- reactive({
+  validation_split(heart_other(),
+                   strata = stroke,
+                   prop   = 1 - prop.validation)
+})
+```
+
+```{r create.model}
+lr_mod <-
+  logistic_reg(mixture = 1, penalty = tune()) %>%
+  set_engine("glmnet")
+
+```
+
+```{r create.recipe}
+
+lr_recipe <- reactive({
+  recipe(stroke ~ ., data = heart_other()) %>%
+    step_dummy(all_nominal(),-all_outcomes()) %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_predictors())
+})
+```
+
+```{r create.workflow}
+lr_workflow <- reactive({
+  workflow() %>%
+    add_model(lr_mod) %>%
+    add_recipe(lr_recipe())
+})
+```
+
+```{r tuning.grid}
+lr_reg_grid <-
+  tibble(penalty = 10 ^ seq(-4,-1, length.out = 10))  
+
+# Train and tune the model
+lr_tune <- reactive({
+  lr_workflow() %>%
+    tune_grid(
+      resamples = val_set(),
+      #rset object
+      grid      = lr_reg_grid,
+      control   = control_grid(save_pred = TRUE),
+      #needed to get data for ROC curve
+      metrics   = metric_set(roc_auc)
+    )
+})
+
+
+lr_best <- reactive({
+  lr_tune() %>% 
+  select_best("roc_auc")
+})
+
+```
+
+```{r best.workflow}
+# Add best validation model to workflow
+lr_workflow_best <- reactive({
+  finalize_workflow(lr_workflow(),
+                    lr_best())       #needs to have the same column name as tune()
+})
+
+```
+
+```{r fit.training}
+# Inspect fit on entire training data
+lr_fit <- reactive({
+  lr_workflow_best() %>%
+    fit(heart_other())
+})  
+```
+
+```{r last.fit}
+lr_last_fit <- reactive({
+  last_fit(lr_workflow_best(),
+           splits())
+})  
+
+```
+
+```{r confusion.matrix}
+lr_conf_mat <- reactive({
+  lr_last_fit() %>%
+    collect_predictions() %>%
+    conf_mat(truth = stroke, estimate = .pred_class)
+})  
+```
+
+**Correlation matrix chart**
+=================================================================
+  
+```{r}
+select(heart, -c("id")) %>%
+  keep(is.numeric) %>%
+  chart.Correlation(heart[, 2:3],
+                    histogram = TRUE,
+                    method = c("pearson"))
+```
+
+**Data summary**
+=================================================================
+```{r}
+skim(heart)
+```
+
+**Validation Summary**
+===========================================================
+
+
+## Column {data-width="500"}
+
+### Data Splitting
+
+**Total Observations:**  
+`r reactive(dim(heart_filtered())[1] %>% scales::comma())`
+
+**Training Set:**  
+`r reactive(dim(heart_other())[1] %>% scales::comma())`
+
+**Validation Set:**  
+`r reactive((dim(heart_other())[1] * prop.validation) %>% scales::comma())`
+
+**Testing Set:**  
+`r reactive(dim(heart_test())[1] %>% scales::comma())`
+
+
+
+
+### Data Viewer
+
+```{r}
+heart %>%
+  slice(1:100) %>%
+  datatable(
+    options = list(
+      searching = FALSE,
+      pageLength = 50,
+      lengthMenu = c(50, 100)
+    ),
+    style = "default"
+  )
+
+```
+
+
+## Column {data-width="500"}
+
+### Case Imbalance Check
+
+```{r}
+output$case_plot <- renderPlot({
+  lr_recipe() %>%
+    prep() %>%
+    juice() %>%
+    ggplot(aes(stroke)) +
+    geom_bar(fill = wes_palette("BottleRocket1")[3]) +
+    theme_light()
+})
+plotOutput(outputId = "case_plot")
+```
+
+### Workflow
+
+```{r}
+# Report workflow with optimized `penalty`
+renderPrint(lr_workflow_best())
+
+```
+
+**Classification Results**
+===========================================================
+
+## Column {data-width="500"}
+
+### ROC
+
+```{r}
+
+output$lr_auc <- renderPlot({
+  lr_tune() %>%
+    collect_predictions(parameters = lr_best()) %>%
+    roc_curve(stroke, .pred_Yes) %>%
+    ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+    geom_path(color = hotel.palette[4]) +
+    geom_abline(lty = 3, color = hotel.palette[4]) +
+    coord_equal() +
+    theme_classic()
+})
+
+plotOutput(outputId = "lr_auc")
+
+
+```
+
+
+### Confusion Matrix
+
+```{r}
+# renderPrint(lr_conf_mat() %>% tidy())
+
+output$conf_mat_plot <- renderPlot({
+  lr_conf_mat() %>%
+    autoplot(type = "heatmap")
+})
+
+
+plotOutput(outputId = "conf_mat_plot")
+
+```
+
+
+## Column {data-width="500"}
+
+### Variable Importance Plot
+
+```{r, vip.plot}
+output$vip_plot <- renderPlot({
+  lr_fit() %>%
+    pull_workflow_fit() %>%
+    vip(
+      num_features = 20,
+      aesthetics = list(
+        color = wes_palette("BottleRocket1")[3],
+        fill = wes_palette("BottleRocket1")[3],
+        size = 0.3
+      )
+    ) +
+    theme_light()
+})
+
+plotOutput(outputId = "vip_plot")
+
+```
+
+### Prediction Metrics
+
+```{r}
+output$metrics <- renderTable({
+  lr_conf_mat() %>%
+    summary() %>%
+    select(-.estimator)
+})
+
+tableOutput(outputId = "metrics")
+
+```
+
